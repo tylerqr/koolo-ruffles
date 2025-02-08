@@ -13,13 +13,14 @@ import (
 	"github.com/hectorgimenez/koolo/internal/game"
 	"github.com/hectorgimenez/koolo/internal/pather"
 	"github.com/hectorgimenez/koolo/internal/utils"
+	"github.com/hectorgimenez/koolo/internal/log"
 )
 
 const (
-	maxInteractions = 9 // 10 attempts since we start at 0
+	maxInteractions = 30
 	spiralDelay     = 50 * time.Millisecond
-	clickDelay      = 25 * time.Millisecond
-	pickupTimeout   = 3 * time.Second
+	clickDelay      = 100 * time.Millisecond
+	pickupTimeout   = 8 * time.Second
 )
 
 var (
@@ -29,78 +30,45 @@ var (
 	ErrCastingMoving     = errors.New("char casting or moving")
 )
 
-func PickupItem(it data.Item, itemPickupAttempt int) error {
+func PickupItem(it data.Item) error {
 	ctx := context.Get()
-	ctx.SetLastStep("PickupItem")
-
-	// Casting skill/moving return back
-	for ctx.Data.PlayerUnit.Mode == mode.CastingSkill || ctx.Data.PlayerUnit.Mode == mode.Running || ctx.Data.PlayerUnit.Mode == mode.Walking || ctx.Data.PlayerUnit.Mode == mode.WalkingInTown {
-		time.Sleep(25 * time.Millisecond)
-		return ErrCastingMoving
-	}
-
-	// Calculate base screen position for item
-	baseX := it.Position.X - 1
-	baseY := it.Position.Y - 1
-	baseScreenX, baseScreenY := ctx.PathFinder.GameCoordsToScreenCords(baseX, baseY)
-
-	// Check for monsters first
-	if hasHostileMonstersNearby(it.Position) {
-		return ErrMonsterAroundItem
-	}
-
-	// Validate line of sight
-	if !ctx.PathFinder.LineOfSight(ctx.Data.PlayerUnit.Position, it.Position) {
-		return ErrNoLOSToItem
-	}
-
-	// Check distance
-	distance := ctx.PathFinder.DistanceFromMe(it.Position)
-	if distance >= 7 {
-		// Try to move closer if possible
-		if distance < 10 {
-			err := MoveTo(it.Position)
-			if err == nil {
-				// Recalculate distance after moving
-				distance = ctx.PathFinder.DistanceFromMe(it.Position)
-			}
-		}
-		
-		if distance >= 7 {
-			return fmt.Errorf("%w (%d): %s", ErrItemTooFar, distance, it.Desc().Name)
-		}
-	}
-
-	ctx.Logger.Debug(fmt.Sprintf("Picking up: %s [%s]", it.Desc().Name, it.Quality.ToString()))
-
-	// Track interaction state
-	waitingForInteraction := time.Time{}
-	spiralAttempt := 0
-	targetItem := it
-	lastMonsterCheck := time.Now()
-	const monsterCheckInterval = 150 * time.Millisecond
-
 	startTime := time.Now()
+	waitingForInteraction := time.Zero
+	spiralAttempt := 0
+	lastMonsterCheck := time.Now()
+	const monsterCheckInterval = time.Second
+
+	// Initial position check
+	initialPlayerPos := ctx.Data.PlayerUnit.Position
+	baseX, baseY := it.Position.X, it.Position.Y
+	baseScreenX, baseScreenY := ctx.PathFinder.GameCoordsToScreenCords(baseX, baseY)
 
 	for {
 		ctx.PauseIfNotPriority()
 		ctx.RefreshGameData()
 
-		// Periodic monster check
-		if time.Since(lastMonsterCheck) > monsterCheckInterval {
-			if hasHostileMonstersNearby(it.Position) {
-				return ErrMonsterAroundItem
-			}
-			lastMonsterCheck = time.Now()
+		// 1. Verify player hasn't moved
+		if !initialPlayerPos.Equal(ctx.Data.PlayerUnit.Position) {
+			ctx.Logger.Debug("Player position changed during pickup attempt, recalculating",
+				log.String("item", it.Desc().Name))
+			initialPlayerPos = ctx.Data.PlayerUnit.Position
+			baseScreenX, baseScreenY = ctx.PathFinder.GameCoordsToScreenCords(baseX, baseY)
 		}
 
-		// Check if item still exists
-		currentItem, exists := findItemOnGround(targetItem.UnitID)
+		// 2. Verify item still exists and hasn't moved
+		currentItem, exists := findItemOnGround(it.UnitID)
 		if !exists {
-			ctx.Logger.Info(fmt.Sprintf("Picked up: %s [%s] | Attempt:%d | Spiral:%d", 
-				targetItem.Desc().Name, targetItem.Quality.ToString(), 
-				itemPickupAttempt, spiralAttempt))
-			return nil // Success!
+			ctx.Logger.Info(fmt.Sprintf("Picked up: %s [%s] | Attempt:%d",
+				it.Desc().Name, it.Quality.ToString(), spiralAttempt))
+			return nil
+		}
+
+		// 3. Verify item position hasn't changed
+		if currentItem.Position.X != baseX || currentItem.Position.Y != baseY {
+			ctx.Logger.Debug("Item position changed, updating coordinates",
+				log.String("item", it.Desc().Name))
+			baseX, baseY = currentItem.Position.X, currentItem.Position.Y
+			baseScreenX, baseScreenY = ctx.PathFinder.GameCoordsToScreenCords(baseX, baseY)
 		}
 
 		// Check timeout conditions
@@ -110,26 +78,51 @@ func PickupItem(it data.Item, itemPickupAttempt int) error {
 			return fmt.Errorf("failed to pick up %s after %d attempts", it.Desc().Name, spiralAttempt)
 		}
 
-		// Get spiral offset with slightly larger pattern for better coverage
-		offsetX, offsetY := getSpiralOffset(spiralAttempt)
-		cursorX := baseScreenX + offsetX
-		cursorY := baseScreenY + offsetY
+		// 4. Monster check with increased frequency for valuable items
+		if time.Since(lastMonsterCheck) > monsterCheckInterval {
+			if hasHostileMonstersNearby(currentItem.Position) {
+				return ErrMonsterAroundItem
+			}
+			lastMonsterCheck = time.Now()
+		}
+
+		// 5. Calculate and verify cursor position
+		offsetX, offsetY := utils.ItemSpiral(spiralAttempt)
+		targetCursorX := baseScreenX + offsetX
+		targetCursorY := baseScreenY + offsetY
 
 		// Move cursor and verify position
-		ctx.HID.MovePointer(cursorX, cursorY)
-		ctx.RefreshGameData()
+		ctx.HID.MovePointer(targetCursorX, targetCursorY)
 		time.Sleep(50 * time.Millisecond)
+		
+		// 6. Verify cursor position after movement
+		actualX, actualY := ctx.HID.GetCursorPosition()
+		if abs(actualX-targetCursorX) > 5 || abs(actualY-targetCursorY) > 5 {
+			ctx.Logger.Debug("Cursor position mismatch, retrying movement",
+				log.Int("targetX", targetCursorX),
+				log.Int("actualX", actualX),
+				log.Int("targetY", targetCursorY),
+				log.Int("actualY", actualY))
+			continue
+		}
 
-		// If item is hovered, try multiple quick clicks
+		ctx.RefreshGameData()
+
+		// 7. Verify item is actually hovered
 		if currentItem.IsHovered {
-			// Try up to 3 quick clicks
+			// Try multiple quick clicks when item is hovered
 			for clickAttempt := 0; clickAttempt < 3; clickAttempt++ {
-				ctx.HID.Click(game.LeftButton, cursorX, cursorY)
-				time.Sleep(50 * time.Millisecond)
+				// Final position verification before click
+				if !verifyPickupConditions(ctx, currentItem, initialPlayerPos) {
+					break
+				}
 				
-				// Verify if item still exists after click
-				if _, stillExists := findItemOnGround(targetItem.UnitID); !stillExists {
-					return nil // Successfully picked up
+				ctx.HID.Click(game.LeftButton, targetCursorX, targetCursorY)
+				time.Sleep(clickDelay)
+
+				// Check if item was picked up
+				if _, stillExists := findItemOnGround(it.UnitID); !stillExists {
+					return nil
 				}
 			}
 
@@ -138,28 +131,37 @@ func PickupItem(it data.Item, itemPickupAttempt int) error {
 			}
 		}
 
-		if spiralAttempt > 0 && spiralAttempt%15 == 0 && resetAttempts < maxResetAttempts {
-			// Reset position and start spiral pattern over
-			ctx.HID.MovePointer(baseScreenX, baseScreenY)
-			time.Sleep(100 * time.Millisecond)
-			spiralAttempt = 0
-			resetAttempts++
-			ctx.Logger.Debug("Resetting cursor position for pickup attempt",
-				slog.String("item", it.Desc().Name),
-				slog.Int("resetAttempt", resetAttempts))
-		}
-
 		spiralAttempt++
 	}
 }
 
-// Helper function for improved spiral pattern
-func getSpiralOffset(attempt int) (int, int) {
-	// Increase spiral size slightly for better coverage
-	spiralScale := 1.2
-	baseOffset := utils.ItemSpiral(attempt)
-	return int(float64(baseOffset.X) * spiralScale), 
-		   int(float64(baseOffset.Y) * spiralScale)
+// Helper function to verify all conditions are still valid before clicking
+func verifyPickupConditions(ctx *context.Context, item data.Item, initialPos data.Position) bool {
+	// Verify player hasn't moved
+	if !initialPos.Equal(ctx.Data.PlayerUnit.Position) {
+		return false
+	}
+
+	// Verify item still exists and is still hovered
+	currentItem, exists := findItemOnGround(item.UnitID)
+	if !exists || !currentItem.IsHovered {
+		return false
+	}
+
+	// Verify item position hasn't changed
+	if !currentItem.Position.Equal(item.Position) {
+		return false
+	}
+
+	return true
+}
+
+// Helper function to calculate absolute difference
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 func hasHostileMonstersNearby(pos data.Position) bool {
