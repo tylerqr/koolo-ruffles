@@ -7,6 +7,7 @@ import (
 
 	"github.com/hectorgimenez/d2go/pkg/data"
 	"github.com/hectorgimenez/d2go/pkg/data/item"
+	"github.com/hectorgimenez/d2go/pkg/data/mode"
 	"github.com/hectorgimenez/d2go/pkg/data/stat"
 	"github.com/hectorgimenez/koolo/internal/context"
 	"github.com/hectorgimenez/koolo/internal/game"
@@ -15,7 +16,7 @@ import (
 )
 
 const (
-	maxInteractions = 45
+	maxInteractions = 9 // 10 attempts since we start at 0
 	spiralDelay     = 50 * time.Millisecond
 	clickDelay      = 25 * time.Millisecond
 	pickupTimeout   = 3 * time.Second
@@ -25,11 +26,18 @@ var (
 	ErrItemTooFar        = errors.New("item is too far away")
 	ErrNoLOSToItem       = errors.New("no line of sight to item")
 	ErrMonsterAroundItem = errors.New("monsters detected around item")
+	ErrCastingMoving     = errors.New("char casting or moving")
 )
 
-func PickupItem(it data.Item) error {
+func PickupItem(it data.Item, itemPickupAttempt int) error {
 	ctx := context.Get()
 	ctx.SetLastStep("PickupItem")
+
+	// Casting skill/moving return back
+	for ctx.Data.PlayerUnit.Mode == mode.CastingSkill || ctx.Data.PlayerUnit.Mode == mode.Running || ctx.Data.PlayerUnit.Mode == mode.Walking || ctx.Data.PlayerUnit.Mode == mode.WalkingInTown {
+		time.Sleep(25 * time.Millisecond)
+		return ErrCastingMoving
+	}
 
 	// Calculate base screen position for item
 	baseX := it.Position.X - 1
@@ -59,7 +67,7 @@ func PickupItem(it data.Item) error {
 	spiralAttempt := 0
 	targetItem := it
 	lastMonsterCheck := time.Now()
-	const monsterCheckInterval = 250 * time.Millisecond
+	const monsterCheckInterval = 150 * time.Millisecond
 
 	startTime := time.Now()
 
@@ -78,14 +86,14 @@ func PickupItem(it data.Item) error {
 		// Check if item still exists
 		currentItem, exists := findItemOnGround(targetItem.UnitID)
 		if !exists {
-			ctx.Logger.Info(fmt.Sprintf("Picked up: %s [%s]", targetItem.Desc().Name, targetItem.Quality.ToString()))
+			ctx.Logger.Info(fmt.Sprintf("Picked up: %s [%s] | Item Pickup Attempt:%d | Spiral Attempt:%d", targetItem.Desc().Name, targetItem.Quality.ToString(), itemPickupAttempt, spiralAttempt))
 			return nil // Success!
 		}
 
 		// Check timeout conditions
 		if spiralAttempt > maxInteractions ||
 			(!waitingForInteraction.IsZero() && time.Since(waitingForInteraction) > pickupTimeout) ||
-			time.Since(startTime) > pickupTimeout*2 {
+			time.Since(startTime) > pickupTimeout {
 			return fmt.Errorf("failed to pick up %s after %d attempts", it.Desc().Name, spiralAttempt)
 		}
 
@@ -95,11 +103,10 @@ func PickupItem(it data.Item) error {
 
 		// Move cursor directly to target position
 		ctx.HID.MovePointer(cursorX, cursorY)
-		time.Sleep(spiralDelay)
-
-		// Refresh game state and check hover
 		ctx.RefreshGameData()
+		time.Sleep(50 * time.Millisecond)
 
+		// Click on item if mouse is hovering over
 		if currentItem.IsHovered {
 			ctx.HID.Click(game.LeftButton, cursorX, cursorY)
 			time.Sleep(clickDelay)
