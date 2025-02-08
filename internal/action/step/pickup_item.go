@@ -57,7 +57,18 @@ func PickupItem(it data.Item, itemPickupAttempt int) error {
 	// Check distance
 	distance := ctx.PathFinder.DistanceFromMe(it.Position)
 	if distance >= 7 {
-		return fmt.Errorf("%w (%d): %s", ErrItemTooFar, distance, it.Desc().Name)
+		// Try to move closer if possible
+		if distance < 10 {
+			err := MoveTo(it.Position)
+			if err == nil {
+				// Recalculate distance after moving
+				distance = ctx.PathFinder.DistanceFromMe(it.Position)
+			}
+		}
+		
+		if distance >= 7 {
+			return fmt.Errorf("%w (%d): %s", ErrItemTooFar, distance, it.Desc().Name)
+		}
 	}
 
 	ctx.Logger.Debug(fmt.Sprintf("Picking up: %s [%s]", it.Desc().Name, it.Quality.ToString()))
@@ -86,7 +97,9 @@ func PickupItem(it data.Item, itemPickupAttempt int) error {
 		// Check if item still exists
 		currentItem, exists := findItemOnGround(targetItem.UnitID)
 		if !exists {
-			ctx.Logger.Info(fmt.Sprintf("Picked up: %s [%s] | Item Pickup Attempt:%d | Spiral Attempt:%d", targetItem.Desc().Name, targetItem.Quality.ToString(), itemPickupAttempt, spiralAttempt))
+			ctx.Logger.Info(fmt.Sprintf("Picked up: %s [%s] | Attempt:%d | Spiral:%d", 
+				targetItem.Desc().Name, targetItem.Quality.ToString(), 
+				itemPickupAttempt, spiralAttempt))
 			return nil // Success!
 		}
 
@@ -97,36 +110,58 @@ func PickupItem(it data.Item, itemPickupAttempt int) error {
 			return fmt.Errorf("failed to pick up %s after %d attempts", it.Desc().Name, spiralAttempt)
 		}
 
-		offsetX, offsetY := utils.ItemSpiral(spiralAttempt)
+		// Get spiral offset with slightly larger pattern for better coverage
+		offsetX, offsetY := getSpiralOffset(spiralAttempt)
 		cursorX := baseScreenX + offsetX
 		cursorY := baseScreenY + offsetY
 
-		// Move cursor directly to target position
+		// Move cursor and verify position
 		ctx.HID.MovePointer(cursorX, cursorY)
 		ctx.RefreshGameData()
 		time.Sleep(50 * time.Millisecond)
 
-		// Click on item if mouse is hovering over
+		// If item is hovered, try multiple quick clicks
 		if currentItem.IsHovered {
-			ctx.HID.Click(game.LeftButton, cursorX, cursorY)
-			time.Sleep(clickDelay)
+			// Try up to 3 quick clicks
+			for clickAttempt := 0; clickAttempt < 3; clickAttempt++ {
+				ctx.HID.Click(game.LeftButton, cursorX, cursorY)
+				time.Sleep(50 * time.Millisecond)
+				
+				// Verify if item still exists after click
+				if _, stillExists := findItemOnGround(targetItem.UnitID); !stillExists {
+					return nil // Successfully picked up
+				}
+			}
 
 			if waitingForInteraction.IsZero() {
 				waitingForInteraction = time.Now()
 			}
-			continue
 		}
 
-		// Sometimes we got stuck because mouse is hovering a chest and item is in behind, it usually happens a lot
-		// on Andariel, so we open it
-		if isChestHovered() {
-			ctx.HID.Click(game.LeftButton, cursorX, cursorY)
-			time.Sleep(50 * time.Millisecond)
+		if spiralAttempt > 0 && spiralAttempt%15 == 0 && resetAttempts < maxResetAttempts {
+			// Reset position and start spiral pattern over
+			ctx.HID.MovePointer(baseScreenX, baseScreenY)
+			time.Sleep(100 * time.Millisecond)
+			spiralAttempt = 0
+			resetAttempts++
+			ctx.Logger.Debug("Resetting cursor position for pickup attempt",
+				slog.String("item", it.Desc().Name),
+				slog.Int("resetAttempt", resetAttempts))
 		}
 
 		spiralAttempt++
 	}
 }
+
+// Helper function for improved spiral pattern
+func getSpiralOffset(attempt int) (int, int) {
+	// Increase spiral size slightly for better coverage
+	spiralScale := 1.2
+	baseOffset := utils.ItemSpiral(attempt)
+	return int(float64(baseOffset.X) * spiralScale), 
+		   int(float64(baseOffset.Y) * spiralScale)
+}
+
 func hasHostileMonstersNearby(pos data.Position) bool {
 	ctx := context.Get()
 
